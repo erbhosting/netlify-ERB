@@ -1,49 +1,86 @@
-// netlify/edge-functions/proxy.js
+/**
+ * Netlify Edge Function — Optimized XHTTP/VLESS Proxy
+ *
+ * بهینه‌سازی‌ها:
+ *  - بدون buffering: body مستقیم pipe میشه (ReadableStream)
+ *  - hop-by-hop headers از هر دو طرف حذف میشن (منبع اصلی قطعی)
+ *  - host header درست ست میشه برای بک‌اند
+ *  - duplex: "half" برای streaming request body
+ *  - استفاده از Netlify.env (API رسمی Deno روی Netlify)
+ *  - error handling کامل
+ */
 
-// Read the backend URL from environment variables,
-// fallback value is just a placeholder – you must set it in Netlify.
-const BACKEND_URL = Netlify.env.get("BACKEND_URL") || "https://your-backend-server.com";
+// این headerها نباید بین proxy و backend منتقل بشن
+// منبع اصلی disconnect در اکثر پروکسی‌ها همینه
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailers",
+  "transfer-encoding",
+  "upgrade",
+  "proxy-connection",
+  "host", // host رو خودمون دستی ست می‌کنیم
+]);
 
-export default async function handler(request, context) {
+export default async (request, context) => {
+  // خواندن BACKEND_URL با API رسمی Netlify Edge Functions
+  const BACKEND_URL = Netlify.env.get("BACKEND_URL");
+
+  if (!BACKEND_URL) {
+    return new Response("Configuration error: BACKEND_URL is not set.", {
+      status: 500,
+      headers: { "content-type": "text/plain" },
+    });
+  }
+
+  // ساخت URL بک‌اند — path و query string رو کامل منتقل می‌کنیم
+  const incomingUrl = new URL(request.url);
+  const upstreamUrl = BACKEND_URL + incomingUrl.pathname + incomingUrl.search;
+
+  // کپی هدرهای ورودی، بدون hop-by-hop headers
+  const upstreamHeaders = new Headers();
+  for (const [key, value] of request.headers) {
+    if (!HOP_BY_HOP.has(key.toLowerCase())) {
+      upstreamHeaders.set(key, value);
+    }
+  }
+
+  // host header رو به بک‌اند اصلی ست می‌کنیم
+  upstreamHeaders.set("host", new URL(BACKEND_URL).host);
+
   try {
-    const url = new URL(request.url);
-    // Keep the original path + query string
-    const targetPath = url.pathname + url.search;
-    const upstreamUrl = new URL(targetPath, BACKEND_URL).toString();
-
-    // Copy headers from the incoming request
-    const headers = new Headers(request.headers);
-    headers.delete("host");
-    headers.delete("x-forwarded-proto");
-    headers.delete("x-forwarded-host");
-
-    // Build the request to your backend – the body is streamed directly
-    const upstreamRequest = new Request(upstreamUrl, {
+    // ارسال request به بک‌اند
+    // duplex: "half" — برای stream کردن body ضروریه، بدونش body buffer میشه
+    const upstreamResponse = await fetch(upstreamUrl, {
       method: request.method,
-      headers: headers,
-      body: request.body,   // ReadableStream, no buffering
-      redirect: "manual",
+      headers: upstreamHeaders,
+      body: request.body,
+      duplex: "half",
     });
 
-    // Forward the request
-    const upstreamResponse = await fetch(upstreamRequest);
-
-    // Prepare response headers, drop hop‑by‑hop headers
+    // کپی هدرهای پاسخ، باز بدون hop-by-hop headers
     const responseHeaders = new Headers();
-    for (const [key, value] of upstreamResponse.headers.entries()) {
-      if (!["transfer-encoding", "connection", "keep-alive"].includes(key.toLowerCase())) {
+    for (const [key, value] of upstreamResponse.headers) {
+      if (!HOP_BY_HOP.has(key.toLowerCase())) {
         responseHeaders.set(key, value);
       }
     }
 
-    // Return the upstream response, its body remains a ReadableStream
+    // برگرداندن پاسخ به صورت کامل streaming — بدون هیچ buffer یا تبدیل
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
       statusText: upstreamResponse.statusText,
       headers: responseHeaders,
     });
-  } catch (error) {
-    console.error("Proxy error:", error);
-    return new Response(`Proxy Error: ${error.message}`, { status: 502 });
+
+  } catch (err) {
+    console.error(`[proxy] upstream error: ${err.message}`);
+    return new Response(`Bad Gateway: ${err.message}`, {
+      status: 502,
+      headers: { "content-type": "text/plain" },
+    });
   }
-}
+};
